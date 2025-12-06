@@ -1,0 +1,28 @@
+# Air configuration for hot reloading Go server
+# Docs: https://github.com/air-verse/air
+
+root = "."
+tmp_dir = "tmp"
+
+[build]
+# Build the app into tmp and run it.
+cmd = "go build -o ./tmp/main ."
+bin = "./tmp/main"
+# If your app needs env vars, put them in .env and Air will load it automatically.
+include_ext = ["go", "tpl", "tmpl", "html", "gohtml"]
+exclude_regex = ["_test.go$"]
+exclude_dir = ["tmp", "node_modules", ".git"]
+delay = 1000 # milliseconds
+stop_on_error = true
+kill_delay = 500 # milliseconds
+
+[color]
+main = "cyan"
+watcher = "yellow"
+app = "green"
+
+[log]
+time = true
+
+[misc]
+clean_on_exit = true

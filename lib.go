@@ -140,12 +140,8 @@ func DefaultConfig() *Config {
 		TemplateFuncs:         template.FuncMap{},
 		RegisterHooks:         nil,
 		EnableVersionEndpoint: true,
-		CommonHeaders: map[string]string{
-			"X-Content-Type-Options": "nosniff",
-			"X-Frame-Options":        "DENY",
-			"Referrer-Policy":        "no-referrer-when-downgrade",
-		},
-		EnableHTTPCallLogs: true,
+		CommonHeaders:         map[string]string{},
+		EnableHTTPCallLogs:    true,
 	}
 }
 

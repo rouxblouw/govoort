@@ -24,6 +24,8 @@ type Page struct {
 	Post map[string]func(r *http.Request) (any, error)
 	// globals are global data providers executed before template rendering (merged with page data)
 	globals []GlobalDataFunc
+	// error500 is the template used for internal server errors
+	error500 *template.Template
 }
 
 func (p *Page) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -44,7 +46,8 @@ func (p *Page) serveGet(w http.ResponseWriter, r *http.Request) {
 		pageData, err = p.Data(r)
 		if err != nil {
 			log.Printf("GET data hook error for %s: %v", p.Route, err)
-			http.Error(w, "internal server error", http.StatusInternalServerError)
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = executePageTemplate(w, p.error500, nil)
 			return
 		}
 	}
@@ -53,13 +56,20 @@ func (p *Page) serveGet(w http.ResponseWriter, r *http.Request) {
 	merged, err := mergeWithGlobals(p.globals, pageData, r)
 	if err != nil {
 		log.Printf("global data hook error for %s: %v", p.Route, err)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = executePageTemplate(w, p.error500, nil)
 		return
 	}
 
 	if err := executePageTemplate(w, p.Template, merged); err != nil {
 		log.Printf("template execute error for %s: %v", p.Route, err)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		// Header might have been partially written if executePageTemplate failed mid-way,
+		// but executePageTemplate currently doesn't write header before execution.
+		// Actually, executePageTemplate calls t.Execute which writes to w.
+		// If it fails mid-execution, we can't easily send a 500 template.
+		// But let's try anyway if possible.
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = executePageTemplate(w, p.error500, nil)
 	}
 }
 
@@ -83,7 +93,8 @@ func (p *Page) servePost(w http.ResponseWriter, r *http.Request) {
 	data, err := handler(r)
 	if err != nil {
 		log.Printf("POST action '%s' error for %s: %v", action, p.Route, err)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = executePageTemplate(w, p.error500, nil)
 		return
 	}
 
@@ -97,13 +108,15 @@ func (p *Page) servePost(w http.ResponseWriter, r *http.Request) {
 	merged, mErr := mergeWithGlobals(p.globals, data, r)
 	if mErr != nil {
 		log.Printf("global data hook error (post) for %s: %v", p.Route, mErr)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = executePageTemplate(w, p.error500, nil)
 		return
 	}
 
 	if err := executePageTemplate(w, p.Template, merged); err != nil {
 		log.Printf("template execute (post) error for %s: %v", p.Route, err)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = executePageTemplate(w, p.error500, nil)
 	}
 }
 
@@ -261,6 +274,10 @@ type Config struct {
 	CommonHeaders map[string]string
 	// EnableHTTPCallLogs controls whether each HTTP request handling is logged with its response time in ms (default: true)
 	EnableHTTPCallLogs bool
+	// NotFoundTemplate is the template name for 404 errors (default: "404")
+	NotFoundTemplate string
+	// InternalErrorTemplate is the template name for 500 errors (default: "500")
+	InternalErrorTemplate string
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -277,6 +294,8 @@ func DefaultConfig() *Config {
 		EnableVersionEndpoint: true,
 		CommonHeaders:         map[string]string{},
 		EnableHTTPCallLogs:    true,
+		NotFoundTemplate:      "404",
+		InternalErrorTemplate: "500",
 	}
 }
 
@@ -284,9 +303,11 @@ var appStart = time.Now().UnixMilli()
 
 // Server represents a Govoort server instance.
 type Server struct {
-	config *Config
-	pages  map[string]*Page
-	mux    *http.ServeMux
+	config   *Config
+	pages    map[string]*Page
+	mux      *http.ServeMux
+	error404 *template.Template
+	error500 *template.Template
 }
 
 // New creates a new Govoort server with the given configuration.
@@ -301,10 +322,35 @@ func New(config *Config) (*Server, error) {
 	}
 
 	mux := http.NewServeMux()
+
+	s := &Server{
+		config: config,
+		pages:  pages,
+		mux:    mux,
+	}
+
+	// Setup error templates
+	if p, ok := pages["/"+config.NotFoundTemplate]; ok {
+		s.error404 = p.Template
+		// remove from regular pages so it doesn't show up in listings or registered as normal route
+		delete(pages, "/"+config.NotFoundTemplate)
+	} else {
+		s.error404 = template.Must(template.New("404").Parse(`<!DOCTYPE html><html><body><h1>404 Not Found</h1><p>The page you are looking for does not exist.</p></body></html>`))
+	}
+
+	if p, ok := pages["/"+config.InternalErrorTemplate]; ok {
+		s.error500 = p.Template
+		delete(pages, "/"+config.InternalErrorTemplate)
+	} else {
+		s.error500 = template.Must(template.New("500").Parse(`<!DOCTYPE html><html><body><h1>500 Internal Server Error</h1><p>Something went wrong on our end.</p></body></html>`))
+	}
+
 	for route, page := range pages {
 		log.Printf("registering route %s", route)
 		// attach global data providers
 		page.globals = append(page.globals, config.GlobalData...)
+		// assign error500 to page
+		page.error500 = s.error500
 		// attach any pre-registered page hooks from code (by route)
 		if hook, ok := getRegisteredPageHook(route); ok {
 			if hook.Data != nil {
@@ -320,10 +366,15 @@ func New(config *Config) (*Server, error) {
 			}
 		}
 
-		mux.Handle(route, page)
-		// Also handle trailing-slash variant to avoid accidental 404s
-		if route != "/" && !strings.HasSuffix(route, "/") {
-			mux.Handle(route+"/", page)
+		// Use exact match patterns (Go 1.22+) to allow the catch-all "/" for 404s
+		if route == "/" {
+			mux.Handle("/{$}", page)
+		} else {
+			mux.Handle(route, page)
+			// Also handle trailing-slash variant exactly to avoid accidental 404s
+			if !strings.HasSuffix(route, "/") {
+				mux.Handle(route+"/{$}", page)
+			}
 		}
 	}
 
@@ -344,16 +395,22 @@ func New(config *Config) (*Server, error) {
 		mux.Handle(config.StaticRoute, http.StripPrefix(config.StaticRoute, fs))
 	}
 
-	return &Server{
-		config: config,
-		pages:  pages,
-		mux:    mux,
-	}, nil
+	// Register 404 handler
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// http.ServeMux with "/" matches everything.
+		// If we are here, it means no other route matched (including static files if they are under a prefix).
+		w.WriteHeader(http.StatusNotFound)
+		_ = executePageTemplate(w, s.error404, nil)
+	})
+
+	return s, nil
 }
 
 // Handler returns the http.Handler for the server.
 func (s *Server) Handler() http.Handler {
 	var h http.Handler = s.mux
+	// Wrap with error recovery to use 500 template
+	h = s.withErrorRecovery(h)
 	if s.config.EnableHTTPCallLogs {
 		h = s.withRequestLogging(h)
 	}
@@ -394,6 +451,19 @@ func (s *Server) withRequestLogging(next http.Handler) http.Handler {
 			return
 		}
 		log.Printf("%s %s in %d ms", r.Method, r.URL.Path, dur.Milliseconds())
+	})
+}
+
+func (s *Server) withErrorRecovery(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("panic recovered: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = executePageTemplate(w, s.error500, nil)
+			}
+		}()
+		next.ServeHTTP(w, r)
 	})
 }
 

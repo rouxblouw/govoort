@@ -9,6 +9,8 @@ A lightweight Go web framework for building server-rendered web applications wit
 - **Shared templates**: Common partials and components in `web/templates/`
 - **Static file serving**: Automatic serving of files from `web/static/`
 - **GET/POST handlers**: Easy-to-define data hooks and form actions per page
+- **Per-route code hooks**: Put Go code next to your page to prepare data before rendering
+- **Global middleware-like data**: Register global data providers (e.g., session, current user) merged into every page render
 - **JSON support**: Automatic JSON responses when requested
 - **Hot reload support**: Built-in `/__version` endpoint for development workflows
 - **Custom template functions**: Add your own template helpers
@@ -97,7 +99,17 @@ func main() {
 
     // Create configuration
     config := govoort.DefaultConfig()
+    // Option A: Register hooks centrally
     config.RegisterHooks = registerPageHooks
+
+    // Option B: Register global data providers (middleware-like)
+    config.GlobalData = []govoort.GlobalDataFunc{
+        func(r *http.Request) (any, error) {
+            // example: fetch session & user
+            user := map[string]any{"ID": 123, "Name": "Ada"}
+            return map[string]any{"CurrentUser": user}, nil
+        },
+    }
 
     // Create and start server
     server, err := govoort.New(config)
@@ -107,6 +119,27 @@ func main() {
 
     if err := server.ListenAndServe(*addr); err != nil {
         log.Fatal(err)
+    }
+}
+
+// Option A: central registration of per-route page hooks
+func registerPageHooks(pages map[string]*govoort.Page) {
+    // Attach a GET data hook for "/"
+    if p, ok := pages["/"]; ok {
+        p.Data = func(r *http.Request) (any, error) {
+            return struct{
+                Title   string
+                Message string
+            }{
+                Title:   "Welcome",
+                Message: "Hello from Govoort",
+            }, nil
+        }
+        // Optional POST actions
+        p.Post["save"] = func(r *http.Request) (any, error) {
+            // do something, then return data for re-render
+            return map[string]any{"Saved": true}, nil
+        }
     }
 }
 
@@ -132,6 +165,71 @@ func registerPageHooks(pages map[string]*govoort.Page) {
     }
 }
 ```
+
+## Per‑Route Code Files (init‑based) — Option B
+
+You can colocate Go code with your pages by creating small `.go` files in your app that register hooks for the matching route during `init()`. Use `govoort.RegisterPage` to attach a data provider and/or POST actions. This is especially useful for pages that need per-request logic (load session, find logged-in user, etc.).
+
+Example for a page at `web/pages/account/profile.gohtml` whose route is `/account/profile`:
+
+```go
+// file: internal/pages/account/profile.go (your app)
+package account
+
+import (
+    "net/http"
+    "github.com/yourusername/govoort"
+)
+
+func init() {
+    govoort.RegisterPage("/account/profile", govoort.PageHook{
+        Data: func(r *http.Request) (any, error) {
+            // load user/session and return any shape (struct or map)
+            return map[string]any{
+                "Title":       "Your profile",
+                "CurrentUser": map[string]any{"Name": "Ada"},
+            }, nil
+        },
+        Post: map[string]func(*http.Request) (any, error){
+            "update": func(r *http.Request) (any, error) {
+                // update profile; on success, return data for re-render
+                return map[string]any{"Updated": true}, nil
+            },
+        },
+    })
+}
+```
+
+Notes:
+- `RegisterPage(route, hook)` can be called from any package. It’s common to mirror your `web/pages/...` path in your Go package layout to keep things organized.
+- The returned values from `Data`/`Post` can be any struct or `map[string]any`. They are merged with any global data (see below) before template rendering. Field/key name collisions are resolved by last-writer-wins: later providers override earlier ones (globals first, then page).
+
+## Global Data Providers (Middleware‑like)
+
+Some values should be available to all pages (e.g., security headers are already handled; you might want to expose `CurrentUser`, CSRF token, feature flags). Use `config.GlobalData` to register one or more `GlobalDataFunc` providers. These run on every request and their results are shallow‑merged into the page data before rendering.
+
+```go
+config.GlobalData = []govoort.GlobalDataFunc{
+    func(r *http.Request) (any, error) {
+        // e.g., read session/cookie and fetch the user
+        user := map[string]any{"ID": 123, "Name": "Ada"}
+        return map[string]any{"CurrentUser": user}, nil
+    },
+    func(r *http.Request) (any, error) {
+        // feature flags
+        return struct{ Beta bool }{Beta: true}, nil
+    },
+}
+```
+
+Merging rules:
+- Providers run in the order supplied; later keys override earlier ones.
+- The page’s own data overrides global data on key/field conflicts.
+- Struct fields are exported by name; `map[string]any` keys are copied as-is.
+
+## JSON responses for POST
+
+When a POST action returns data and the client sets `Accept: application/json` (or posts JSON), Govoort returns JSON instead of re-rendering the HTML page. For normal form submissions (no JSON Accept), the page is re-rendered and its data is merged with global data.
 
 ### 5. Run Your Application
 

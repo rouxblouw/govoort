@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -21,6 +22,8 @@ type Page struct {
 	Data func(r *http.Request) (any, error)
 	// Post contains named POST actions. The action name is selected by form field "action".
 	Post map[string]func(r *http.Request) (any, error)
+	// globals are global data providers executed before template rendering (merged with page data)
+	globals []GlobalDataFunc
 }
 
 func (p *Page) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -35,17 +38,26 @@ func (p *Page) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Page) serveGet(w http.ResponseWriter, r *http.Request) {
-	var data any
+	var pageData any
 	if p.Data != nil {
 		var err error
-		data, err = p.Data(r)
+		pageData, err = p.Data(r)
 		if err != nil {
 			log.Printf("GET data hook error for %s: %v", p.Route, err)
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
 	}
-	if err := executePageTemplate(w, p.Template, data); err != nil {
+
+	// collect global data
+	merged, err := mergeWithGlobals(p.globals, pageData, r)
+	if err != nil {
+		log.Printf("global data hook error for %s: %v", p.Route, err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := executePageTemplate(w, p.Template, merged); err != nil {
 		log.Printf("template execute error for %s: %v", p.Route, err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 	}
@@ -80,7 +92,16 @@ func (p *Page) servePost(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, data)
 		return
 	}
-	if err := executePageTemplate(w, p.Template, data); err != nil {
+
+	// merge globals for HTML re-render
+	merged, mErr := mergeWithGlobals(p.globals, data, r)
+	if mErr != nil {
+		log.Printf("global data hook error (post) for %s: %v", p.Route, mErr)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := executePageTemplate(w, p.Template, merged); err != nil {
 		log.Printf("template execute (post) error for %s: %v", p.Route, err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 	}
@@ -105,6 +126,117 @@ func writeJSON(w http.ResponseWriter, v any) {
 	}
 }
 
+// GlobalDataFunc provides global data for all pages before rendering.
+// It can return any struct or map[string]any; values will be merged.
+type GlobalDataFunc func(r *http.Request) (any, error)
+
+// PageHook allows per-route hooks to provide Data and Post actions.
+type PageHook struct {
+	Data func(r *http.Request) (any, error)
+	Post map[string]func(r *http.Request) (any, error)
+}
+
+// internal registry for page hooks registered by user packages at init().
+var (
+	pageHookRegistry = map[string]PageHook{}
+)
+
+// RegisterPage registers hooks for a route. Typically called from user code in an init() function.
+// Example: govoort.RegisterPage("/account", govoort.PageHook{ Data: func(r *http.Request)(any,error){...} })
+func RegisterPage(route string, hook PageHook) {
+	// merge with any existing to allow multiple registrations to extend Post map
+	if existing, ok := pageHookRegistry[route]; ok {
+		if hook.Data != nil {
+			existing.Data = hook.Data
+		}
+		if hook.Post != nil {
+			if existing.Post == nil {
+				existing.Post = map[string]func(r *http.Request) (any, error){}
+			}
+			for k, v := range hook.Post {
+				existing.Post[k] = v
+			}
+		}
+		pageHookRegistry[route] = existing
+		return
+	}
+	pageHookRegistry[route] = hook
+}
+
+func getRegisteredPageHook(route string) (PageHook, bool) {
+	h, ok := pageHookRegistry[route]
+	return h, ok
+}
+
+// mergeWithGlobals merges data from global providers with page-specific data.
+// Merge order: globals (in provided order) then pageData; later keys overwrite earlier ones.
+// Both structs and map[string]any are supported; result is map[string]any unless all are nil.
+func mergeWithGlobals(globals []GlobalDataFunc, pageData any, r *http.Request) (any, error) {
+	var out map[string]any
+	// collect globals
+	for _, gf := range globals {
+		if gf == nil {
+			continue
+		}
+		v, err := gf(r)
+		if err != nil {
+			return nil, err
+		}
+		if v == nil {
+			continue
+		}
+		if out == nil {
+			out = map[string]any{}
+		}
+		mergeInto(out, v)
+	}
+	if pageData != nil {
+		if out == nil {
+			out = map[string]any{}
+		}
+		mergeInto(out, pageData)
+	}
+	if out == nil {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// mergeInto merges fields/keys from src into dst (map). Struct fields must be exported.
+func mergeInto(dst map[string]any, src any) {
+	if src == nil {
+		return
+	}
+	// if already a map[string]any
+	if m, ok := src.(map[string]any); ok {
+		for k, v := range m {
+			dst[k] = v
+		}
+		return
+	}
+	val := reflect.ValueOf(src)
+	for val.Kind() == reflect.Pointer {
+		if val.IsNil() {
+			return
+		}
+		val = val.Elem()
+	}
+	if val.Kind() == reflect.Struct {
+		t := val.Type()
+		for i := 0; i < val.NumField(); i++ {
+			f := t.Field(i)
+			if f.PkgPath != "" { // unexported
+				continue
+			}
+			name := f.Name
+			dst[name] = val.Field(i).Interface()
+		}
+		return
+	}
+	// fallback: store under generic key
+	dst["Value"] = src
+}
+
 // Config holds configuration for the Govoort framework.
 type Config struct {
 	// PagesDir is the directory where page templates are stored (default: "web/pages")
@@ -121,6 +253,8 @@ type Config struct {
 	TemplateFuncs template.FuncMap
 	// RegisterHooks is called after pages are loaded, allowing you to attach Data and Post handlers
 	RegisterHooks func(pages map[string]*Page)
+	// GlobalData are executed for every request (GET and non-JSON POST responses) and merged into template data
+	GlobalData []GlobalDataFunc
 	// EnableVersionEndpoint enables the /__version endpoint for hot-reload support (default: true)
 	EnableVersionEndpoint bool
 	// CommonHeaders are headers added to all responses
@@ -139,6 +273,7 @@ func DefaultConfig() *Config {
 		StaticRoute:           "/static/",
 		TemplateFuncs:         template.FuncMap{},
 		RegisterHooks:         nil,
+		GlobalData:            nil,
 		EnableVersionEndpoint: true,
 		CommonHeaders:         map[string]string{},
 		EnableHTTPCallLogs:    true,
@@ -168,6 +303,23 @@ func New(config *Config) (*Server, error) {
 	mux := http.NewServeMux()
 	for route, page := range pages {
 		log.Printf("registering route %s", route)
+		// attach global data providers
+		page.globals = append(page.globals, config.GlobalData...)
+		// attach any pre-registered page hooks from code (by route)
+		if hook, ok := getRegisteredPageHook(route); ok {
+			if hook.Data != nil {
+				page.Data = hook.Data
+			}
+			if hook.Post != nil {
+				if page.Post == nil {
+					page.Post = map[string]func(r *http.Request) (any, error){}
+				}
+				for k, v := range hook.Post {
+					page.Post[k] = v
+				}
+			}
+		}
+
 		mux.Handle(route, page)
 		// Also handle trailing-slash variant to avoid accidental 404s
 		if route != "/" && !strings.HasSuffix(route, "/") {

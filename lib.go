@@ -19,9 +19,9 @@ type Page struct {
 	Route    string
 	Template *template.Template
 	// Data is called on GET to provide data for the template. Return nil if not needed.
-	Data func(r *http.Request) (any, error)
+	Data func(w http.ResponseWriter, r *http.Request) (any, error)
 	// Post contains named POST actions. The action name is selected by form field "action".
-	Post map[string]func(r *http.Request) (any, error)
+	Post map[string]func(w http.ResponseWriter, r *http.Request) (any, error)
 	// globals are global data providers executed before template rendering (merged with page data)
 	globals []GlobalDataFunc
 	// error500 is the template used for internal server errors
@@ -40,24 +40,35 @@ func (p *Page) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Page) serveGet(w http.ResponseWriter, r *http.Request) {
+	tracker := &responseWriterTracker{ResponseWriter: w}
 	var pageData any
 	if p.Data != nil {
 		var err error
-		pageData, err = p.Data(r)
+		pageData, err = p.Data(tracker, r)
 		if err != nil {
 			log.Printf("GET data hook error for %s: %v", p.Route, err)
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = executePageTemplate(w, p.error500, nil)
+			if !tracker.wroteHeader {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = executePageTemplate(w, p.error500, nil)
+			}
+			return
+		}
+		if tracker.wroteHeader {
 			return
 		}
 	}
 
 	// collect global data
-	merged, err := mergeWithGlobals(p.globals, pageData, r)
+	merged, err := mergeWithGlobals(tracker, p.globals, pageData, r)
 	if err != nil {
 		log.Printf("global data hook error for %s: %v", p.Route, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = executePageTemplate(w, p.error500, nil)
+		if !tracker.wroteHeader {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = executePageTemplate(w, p.error500, nil)
+		}
+		return
+	}
+	if tracker.wroteHeader {
 		return
 	}
 
@@ -68,12 +79,15 @@ func (p *Page) serveGet(w http.ResponseWriter, r *http.Request) {
 		// Actually, executePageTemplate calls t.Execute which writes to w.
 		// If it fails mid-execution, we can't easily send a 500 template.
 		// But let's try anyway if possible.
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = executePageTemplate(w, p.error500, nil)
+		if !tracker.wroteHeader {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = executePageTemplate(w, p.error500, nil)
+		}
 	}
 }
 
 func (p *Page) servePost(w http.ResponseWriter, r *http.Request) {
+	tracker := &responseWriterTracker{ResponseWriter: w}
 	// Parse form if not already parsed
 	_ = r.ParseForm()
 	action := r.FormValue("action")
@@ -90,11 +104,16 @@ func (p *Page) servePost(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("unknown action"))
 		return
 	}
-	data, err := handler(r)
+	data, err := handler(tracker, r)
 	if err != nil {
 		log.Printf("POST action '%s' error for %s: %v", action, p.Route, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = executePageTemplate(w, p.error500, nil)
+		if !tracker.wroteHeader {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = executePageTemplate(w, p.error500, nil)
+		}
+		return
+	}
+	if tracker.wroteHeader {
 		return
 	}
 
@@ -105,18 +124,25 @@ func (p *Page) servePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// merge globals for HTML re-render
-	merged, mErr := mergeWithGlobals(p.globals, data, r)
+	merged, mErr := mergeWithGlobals(tracker, p.globals, data, r)
 	if mErr != nil {
 		log.Printf("global data hook error (post) for %s: %v", p.Route, mErr)
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = executePageTemplate(w, p.error500, nil)
+		if !tracker.wroteHeader {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = executePageTemplate(w, p.error500, nil)
+		}
+		return
+	}
+	if tracker.wroteHeader {
 		return
 	}
 
 	if err := executePageTemplate(w, p.Template, merged); err != nil {
 		log.Printf("template execute (post) error for %s: %v", p.Route, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = executePageTemplate(w, p.error500, nil)
+		if !tracker.wroteHeader {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = executePageTemplate(w, p.error500, nil)
+		}
 	}
 }
 
@@ -139,14 +165,31 @@ func writeJSON(w http.ResponseWriter, v any) {
 	}
 }
 
+type responseWriterTracker struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (rw *responseWriterTracker) WriteHeader(code int) {
+	rw.wroteHeader = true
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseWriterTracker) Write(b []byte) (int, error) {
+	rw.wroteHeader = true
+	return rw.ResponseWriter.Write(b)
+}
+
 // GlobalDataFunc provides global data for all pages before rendering.
 // It can return any struct or map[string]any; values will be merged.
-type GlobalDataFunc func(r *http.Request) (any, error)
+// If it writes to http.ResponseWriter, further data providers and template rendering are skipped.
+type GlobalDataFunc func(w http.ResponseWriter, r *http.Request) (any, error)
 
 // PageHook allows per-route hooks to provide Data and Post actions.
+// If Data or a Post action writes to http.ResponseWriter, template rendering is skipped.
 type PageHook struct {
-	Data func(r *http.Request) (any, error)
-	Post map[string]func(r *http.Request) (any, error)
+	Data func(w http.ResponseWriter, r *http.Request) (any, error)
+	Post map[string]func(w http.ResponseWriter, r *http.Request) (any, error)
 }
 
 // internal registry for page hooks registered by user packages at init().
@@ -164,7 +207,7 @@ func RegisterPage(route string, hook PageHook) {
 		}
 		if hook.Post != nil {
 			if existing.Post == nil {
-				existing.Post = map[string]func(r *http.Request) (any, error){}
+				existing.Post = map[string]func(w http.ResponseWriter, r *http.Request) (any, error){}
 			}
 			for k, v := range hook.Post {
 				existing.Post[k] = v
@@ -184,16 +227,25 @@ func getRegisteredPageHook(route string) (PageHook, bool) {
 // mergeWithGlobals merges data from global providers with page-specific data.
 // Merge order: globals (in provided order) then pageData; later keys overwrite earlier ones.
 // Both structs and map[string]any are supported; result is map[string]any unless all are nil.
-func mergeWithGlobals(globals []GlobalDataFunc, pageData any, r *http.Request) (any, error) {
+// If any global data provider writes to http.ResponseWriter, further processing is stopped.
+func mergeWithGlobals(w http.ResponseWriter, globals []GlobalDataFunc, pageData any, r *http.Request) (any, error) {
+	tracker, ok := w.(*responseWriterTracker)
+	if !ok {
+		tracker = &responseWriterTracker{ResponseWriter: w}
+	}
+
 	var out map[string]any
 	// collect globals
 	for _, gf := range globals {
 		if gf == nil {
 			continue
 		}
-		v, err := gf(r)
+		v, err := gf(tracker, r)
 		if err != nil {
 			return nil, err
+		}
+		if tracker.wroteHeader {
+			return nil, nil
 		}
 		if v == nil {
 			continue
@@ -358,7 +410,7 @@ func New(config *Config) (*Server, error) {
 			}
 			if hook.Post != nil {
 				if page.Post == nil {
-					page.Post = map[string]func(r *http.Request) (any, error){}
+					page.Post = map[string]func(w http.ResponseWriter, r *http.Request) (any, error){}
 				}
 				for k, v := range hook.Post {
 					page.Post[k] = v
@@ -490,7 +542,7 @@ func loadPagesWithConfig(config *Config) (map[string]*Page, error) {
 			Route:    route,
 			Template: tmpl,
 			Data:     nil,
-			Post:     map[string]func(r *http.Request) (any, error){},
+			Post:     map[string]func(w http.ResponseWriter, r *http.Request) (any, error){},
 		}
 	}
 

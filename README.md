@@ -104,10 +104,14 @@ func main() {
 
     // Option B: Register global data providers (middleware-like)
     config.GlobalData = []govoort.GlobalDataFunc{
-        func(r *http.Request) (any, error) {
-            // example: fetch session & user
-            user := map[string]any{"ID": 123, "Name": "Ada"}
-            return map[string]any{"CurrentUser": user}, nil
+        func(w http.ResponseWriter, r *http.Request) (any, error) {
+            // Check for authentication
+            if !isAuthenticated(r) {
+                // Redirect and return nil. Govoort detects the write and stops further processing.
+                http.Redirect(w, r, "/login", http.StatusFound)
+                return nil, nil
+            }
+            return nil, nil
         },
     }
 
@@ -126,7 +130,7 @@ func main() {
 func registerPageHooks(pages map[string]*govoort.Page) {
     // Attach a GET data hook for "/"
     if p, ok := pages["/"]; ok {
-        p.Data = func(r *http.Request) (any, error) {
+        p.Data = func(w http.ResponseWriter, r *http.Request) (any, error) {
             return struct{
                 Title   string
                 Message string
@@ -136,7 +140,7 @@ func registerPageHooks(pages map[string]*govoort.Page) {
             }, nil
         }
         // Optional POST actions
-        p.Post["save"] = func(r *http.Request) (any, error) {
+        p.Post["save"] = func(w http.ResponseWriter, r *http.Request) (any, error) {
             // do something, then return data for re-render
             return map[string]any{"Saved": true}, nil
         }
@@ -147,7 +151,7 @@ func registerPageHooks(pages map[string]*govoort.Page) {
 func registerPageHooks(pages map[string]*govoort.Page) {
     // Home page data
     if p, ok := pages["/"]; ok {
-        p.Data = func(r *http.Request) (any, error) {
+        p.Data = func(w http.ResponseWriter, r *http.Request) (any, error) {
             return map[string]any{
                 "Title":   "Home",
                 "Message": "Welcome to Govoort!",
@@ -157,7 +161,7 @@ func registerPageHooks(pages map[string]*govoort.Page) {
 
     // About page data
     if p, ok := pages["/about"]; ok {
-        p.Data = func(r *http.Request) (any, error) {
+        p.Data = func(w http.ResponseWriter, r *http.Request) (any, error) {
             return map[string]any{
                 "Title": "About",
             }, nil
@@ -183,15 +187,15 @@ import (
 
 func init() {
     govoort.RegisterPage("/account/profile", govoort.PageHook{
-        Data: func(r *http.Request) (any, error) {
+        Data: func(w http.ResponseWriter, r *http.Request) (any, error) {
             // load user/session and return any shape (struct or map)
             return map[string]any{
                 "Title":       "Your profile",
                 "CurrentUser": map[string]any{"Name": "Ada"},
             }, nil
         },
-        Post: map[string]func(*http.Request) (any, error){
-            "update": func(r *http.Request) (any, error) {
+        Post: map[string]func(w http.ResponseWriter, r *http.Request) (any, error){
+            "update": func(w http.ResponseWriter, r *http.Request) (any, error) {
                 // update profile; on success, return data for re-render
                 return map[string]any{"Updated": true}, nil
             },
@@ -210,14 +214,14 @@ Some values should be available to all pages (e.g., security headers are already
 
 ```go
 config.GlobalData = []govoort.GlobalDataFunc{
-    func(r *http.Request) (any, error) {
-        // e.g., read session/cookie and fetch the user
-        user := map[string]any{"ID": 123, "Name": "Ada"}
-        return map[string]any{"CurrentUser": user}, nil
-    },
-    func(r *http.Request) (any, error) {
-        // feature flags
-        return struct{ Beta bool }{Beta: true}, nil
+    func(w http.ResponseWriter, r *http.Request) (any, error) {
+        // Check for authentication
+        if !isAuthenticated(r) {
+            // Redirect and return nil. Govoort detects the write and stops further processing.
+            http.Redirect(w, r, "/login", http.StatusFound)
+            return nil, nil
+        }
+        return nil, nil
     },
 }
 ```
@@ -293,7 +297,7 @@ Provide data to your templates on GET requests:
 ```go
 func registerPageHooks(pages map[string]*govoort.Page) {
     if p, ok := pages["/products"]; ok {
-        p.Data = func(r *http.Request) (any, error) {
+        p.Data = func(w http.ResponseWriter, r *http.Request) (any, error) {
             products, err := db.GetProducts()
             if err != nil {
                 return nil, err
@@ -331,7 +335,7 @@ Handle form submissions:
 **main.go**:
 ```go
 if p, ok := pages["/contact"]; ok {
-    p.Post["submit"] = func(r *http.Request) (any, error) {
+    p.Post["submit"] = func(w http.ResponseWriter, r *http.Request) (any, error) {
         email := r.FormValue("email")
         message := r.FormValue("message")
 

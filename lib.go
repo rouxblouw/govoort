@@ -187,9 +187,68 @@ type GlobalDataFunc func(w http.ResponseWriter, r *http.Request) (any, error)
 
 // PageHook allows per-route hooks to provide Data and Post actions.
 // If Data or a Post action writes to http.ResponseWriter, template rendering is skipped.
+// PageHook registers hooks for a route.
 type PageHook struct {
-	Data func(w http.ResponseWriter, r *http.Request) (any, error)
-	Post map[string]func(w http.ResponseWriter, r *http.Request) (any, error)
+	// Template is the relative path to the gohtml file from PagesDir.
+	// If empty, it's assumed to be based on the route.
+	Template string
+	Data     func(w http.ResponseWriter, r *http.Request) (any, error)
+	Post     map[string]func(w http.ResponseWriter, r *http.Request) (any, error)
+}
+
+// Router represents a group of routes.
+type Router struct {
+	routes  map[string]PageHook
+	routers []routerMount
+}
+
+type routerMount struct {
+	prefix string
+	router *Router
+}
+
+// NewRouter creates a new Router.
+func NewRouter() *Router {
+	return &Router{
+		routes: make(map[string]PageHook),
+	}
+}
+
+// RegisterPage registers a route with the router.
+func (r *Router) RegisterPage(route string, hook PageHook) {
+	r.routes[route] = hook
+}
+
+// UseRouter mounts another router at a prefix relative to this router.
+func (r *Router) UseRouter(prefix string, sub *Router) {
+	r.routers = append(r.routers, routerMount{
+		prefix: prefix,
+		router: sub,
+	})
+}
+
+// collectRoutes flattens the router hierarchy into a map of routes.
+func (r *Router) collectRoutes(parentPrefix string) map[string]PageHook {
+	allRoutes := make(map[string]PageHook)
+
+	for route, hook := range r.routes {
+		fullRoute := parentPrefix + route
+		if !strings.HasPrefix(fullRoute, "/") {
+			fullRoute = "/" + fullRoute
+		}
+		// Replace any double slashes
+		fullRoute = strings.ReplaceAll(fullRoute, "//", "/")
+		allRoutes[fullRoute] = hook
+	}
+
+	for _, mount := range r.routers {
+		subRoutes := mount.router.collectRoutes(parentPrefix + mount.prefix)
+		for route, hook := range subRoutes {
+			allRoutes[route] = hook
+		}
+	}
+
+	return allRoutes
 }
 
 // internal registry for page hooks registered by user packages at init().
@@ -198,6 +257,7 @@ var (
 )
 
 // RegisterPage registers hooks for a route. Typically called from user code in an init() function.
+// Deprecated: use Router instead to avoid blank imports and for better encapsulation.
 // Example: govoort.RegisterPage("/account", govoort.PageHook{ Data: func(r *http.Request)(any,error){...} })
 func RegisterPage(route string, hook PageHook) {
 	// merge with any existing to allow multiple registrations to extend Post map
@@ -318,6 +378,10 @@ type Config struct {
 	TemplateFuncs template.FuncMap
 	// RegisterHooks is called after pages are loaded, allowing you to attach Data and Post handlers
 	RegisterHooks func(pages map[string]*Page)
+	// Router is the root router for the application. If set, routes registered on it will be added to the server.
+	Router *Router
+	// AutoRegisterPages controls whether the gohtml pages in the PagesDir should be automatically registered (default: true)
+	AutoRegisterPages bool
 	// GlobalData are executed for every request (GET and non-JSON POST responses) and merged into template data
 	GlobalData []GlobalDataFunc
 	// EnableVersionEndpoint enables the /__version endpoint for hot-reload support (default: true)
@@ -342,6 +406,8 @@ func DefaultConfig() *Config {
 		StaticRoute:           "/static/",
 		TemplateFuncs:         template.FuncMap{},
 		RegisterHooks:         nil,
+		Router:                nil,
+		AutoRegisterPages:     false,
 		GlobalData:            nil,
 		EnableVersionEndpoint: true,
 		CommonHeaders:         map[string]string{},
@@ -368,7 +434,14 @@ func New(config *Config) (*Server, error) {
 		config = DefaultConfig()
 	}
 
-	pages, err := loadPagesWithConfig(config)
+	// 1. Collect all routes from the router if provided
+	routerRoutes := make(map[string]PageHook)
+	if config.Router != nil {
+		routerRoutes = config.Router.collectRoutes("")
+	}
+
+	// 2. Load pages (auto-discovery + merging router routes)
+	pages, err := loadPagesWithConfig(config, routerRoutes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load pages: %w", err)
 	}
@@ -403,29 +476,18 @@ func New(config *Config) (*Server, error) {
 		page.globals = append(page.globals, config.GlobalData...)
 		// assign error500 to page
 		page.error500 = s.error500
-		// attach any pre-registered page hooks from code (by route)
-		if hook, ok := getRegisteredPageHook(route); ok {
-			if hook.Data != nil {
-				page.Data = hook.Data
-			}
-			if hook.Post != nil {
-				if page.Post == nil {
-					page.Post = map[string]func(w http.ResponseWriter, r *http.Request) (any, error){}
-				}
-				for k, v := range hook.Post {
-					page.Post[k] = v
-				}
-			}
-		}
 
 		// Use exact match patterns (Go 1.22+) to allow the catch-all "/" for 404s
 		if route == "/" {
-			mux.Handle("/{$}", page)
+			mux.Handle("GET /{$}", page)
+			mux.Handle("POST /{$}", page)
 		} else {
-			mux.Handle(route, page)
+			mux.Handle("GET "+route, page)
+			mux.Handle("POST "+route, page)
 			// Also handle trailing-slash variant exactly to avoid accidental 404s
 			if !strings.HasSuffix(route, "/") {
-				mux.Handle(route+"/{$}", page)
+				mux.Handle("GET "+route+"/{$}", page)
+				mux.Handle("POST "+route+"/{$}", page)
 			}
 		}
 	}
@@ -521,32 +583,107 @@ func (s *Server) withErrorRecovery(next http.Handler) http.Handler {
 
 // Template loading functions
 
-func loadPagesWithConfig(config *Config) (map[string]*Page, error) {
-	pageFiles, err := discoverTemplateFiles(config.PagesDir)
-	if err != nil {
-		return nil, err
-	}
-	if len(pageFiles) == 0 {
-		return nil, fmt.Errorf("no page templates found under %s", config.PagesDir)
+func loadPagesWithConfig(config *Config, routerRoutes map[string]PageHook) (map[string]*Page, error) {
+	pages := make(map[string]*Page)
+
+	// 1. Auto-discover pages if enabled
+	if config.AutoRegisterPages {
+		pageFiles, err := discoverTemplateFiles(config.PagesDir)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+
+		for _, file := range pageFiles {
+			route := routeFromPagePath(config.PagesDir, file)
+			tmpl, err := buildTemplateForWithConfig(file, config)
+			if err != nil {
+				return nil, fmt.Errorf("building template for %s: %w", route, err)
+			}
+			pages[route] = &Page{
+				Route:    route,
+				Template: tmpl,
+				Data:     nil,
+				Post:     map[string]func(w http.ResponseWriter, r *http.Request) (any, error){},
+			}
+		}
 	}
 
-	// Build templates per page
-	pages := make(map[string]*Page)
-	for _, file := range pageFiles {
-		route := routeFromPagePath(config.PagesDir, file)
-		tmpl, err := buildTemplateForWithConfig(file, config)
-		if err != nil {
-			return nil, fmt.Errorf("building template for %s: %w", route, err)
+	// 2. Add routes from router (overwrites auto-discovered routes)
+	for route, hook := range routerRoutes {
+		pageFile := hook.Template
+		if pageFile == "" {
+			// Infer template path from route if not provided
+			// /about -> about.gohtml
+			// / -> index.gohtml
+			// /blog/post -> blog/post.gohtml
+			relPath := strings.TrimPrefix(route, "/")
+			if relPath == "" {
+				relPath = "index"
+			}
+			pageFile = filepath.Join(config.PagesDir, relPath+".gohtml")
+		} else {
+			// If provided, it's relative to PagesDir
+			pageFile = filepath.Join(config.PagesDir, pageFile)
 		}
+
+		tmpl, err := buildTemplateForWithConfig(pageFile, config)
+		if err != nil {
+			return nil, fmt.Errorf("building template for router route %s (file: %s): %w", route, pageFile, err)
+		}
+
 		pages[route] = &Page{
 			Route:    route,
 			Template: tmpl,
-			Data:     nil,
-			Post:     map[string]func(w http.ResponseWriter, r *http.Request) (any, error){},
+			Data:     hook.Data,
+			Post:     hook.Post,
 		}
 	}
 
-	// Allow user to attach hooks for Data/POST actions
+	// 3. Add legacy registered hooks
+	for route, hook := range pageHookRegistry {
+		// This overwrites both auto-discovered and router routes if they collide
+		if p, ok := pages[route]; ok {
+			if hook.Data != nil {
+				p.Data = hook.Data
+			}
+			if hook.Post != nil {
+				if p.Post == nil {
+					p.Post = map[string]func(w http.ResponseWriter, r *http.Request) (any, error){}
+				}
+				for k, v := range hook.Post {
+					p.Post[k] = v
+				}
+			}
+		} else {
+			// If it doesn't exist, we need to load the template
+			pageFile := hook.Template
+			if pageFile == "" {
+				relPath := strings.TrimPrefix(route, "/")
+				if relPath == "" {
+					relPath = "index"
+				}
+				pageFile = filepath.Join(config.PagesDir, relPath+".gohtml")
+			} else {
+				pageFile = filepath.Join(config.PagesDir, pageFile)
+			}
+
+			tmpl, err := buildTemplateForWithConfig(pageFile, config)
+			if err != nil {
+				// We log instead of returning error for legacy compatibility if template is missing
+				log.Printf("warning: legacy RegisterPage route %s failed to load template %s: %v", route, pageFile, err)
+				continue
+			}
+
+			pages[route] = &Page{
+				Route:    route,
+				Template: tmpl,
+				Data:     hook.Data,
+				Post:     hook.Post,
+			}
+		}
+	}
+
+	// 4. Allow legacy RegisterHooks (overwrites again)
 	if config.RegisterHooks != nil {
 		config.RegisterHooks(pages)
 	}

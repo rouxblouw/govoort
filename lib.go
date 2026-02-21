@@ -72,6 +72,10 @@ func (p *Page) serveGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if p.Template == nil {
+		return
+	}
+
 	if err := executePageTemplate(w, p.Template, merged); err != nil {
 		log.Printf("template execute error for %s: %v", p.Route, err)
 		// Header might have been partially written if executePageTemplate failed mid-way,
@@ -120,6 +124,10 @@ func (p *Page) servePost(w http.ResponseWriter, r *http.Request) {
 	// If client explicitly wants JSON, serve JSON; otherwise re-render the page with returned data
 	if wantsJSON(r) {
 		writeJSON(w, data)
+		return
+	}
+
+	if p.Template == nil {
 		return
 	}
 
@@ -192,8 +200,11 @@ type PageHook struct {
 	// Template is the relative path to the gohtml file from PagesDir.
 	// If empty, it's assumed to be based on the route.
 	Template string
-	Data     func(w http.ResponseWriter, r *http.Request) (any, error)
-	Post     map[string]func(w http.ResponseWriter, r *http.Request) (any, error)
+	// NoTemplate specifies that no template is associated with this route.
+	// Useful for API routes where you handle the response manually.
+	NoTemplate bool
+	Data       func(w http.ResponseWriter, r *http.Request) (any, error)
+	Post       map[string]func(w http.ResponseWriter, r *http.Request) (any, error)
 }
 
 // Router represents a group of routes.
@@ -216,6 +227,12 @@ func NewRouter() *Router {
 
 // RegisterPage registers a route with the router.
 func (r *Router) RegisterPage(route string, hook PageHook) {
+	r.routes[route] = hook
+}
+
+// RegisterRoute registers a route that is not a page (no template associated).
+func (r *Router) RegisterRoute(route string, hook PageHook) {
+	hook.NoTemplate = true
 	r.routes[route] = hook
 }
 
@@ -265,6 +282,9 @@ func RegisterPage(route string, hook PageHook) {
 		if hook.Data != nil {
 			existing.Data = hook.Data
 		}
+		if hook.NoTemplate {
+			existing.NoTemplate = true
+		}
 		if hook.Post != nil {
 			if existing.Post == nil {
 				existing.Post = map[string]func(w http.ResponseWriter, r *http.Request) (any, error){}
@@ -277,6 +297,12 @@ func RegisterPage(route string, hook PageHook) {
 		return
 	}
 	pageHookRegistry[route] = hook
+}
+
+// RegisterRoute registers a route that is not a page (no template associated).
+func RegisterRoute(route string, hook PageHook) {
+	hook.NoTemplate = true
+	RegisterPage(route, hook)
 }
 
 func getRegisteredPageHook(route string) (PageHook, bool) {
@@ -610,25 +636,29 @@ func loadPagesWithConfig(config *Config, routerRoutes map[string]PageHook) (map[
 
 	// 2. Add routes from router (overwrites auto-discovered routes)
 	for route, hook := range routerRoutes {
-		pageFile := hook.Template
-		if pageFile == "" {
-			// Infer template path from route if not provided
-			// /about -> about.gohtml
-			// / -> index.gohtml
-			// /blog/post -> blog/post.gohtml
-			relPath := strings.TrimPrefix(route, "/")
-			if relPath == "" {
-				relPath = "index"
+		var tmpl *template.Template
+		if !hook.NoTemplate {
+			pageFile := hook.Template
+			if pageFile == "" {
+				// Infer template path from route if not provided
+				// /about -> about.gohtml
+				// / -> index.gohtml
+				// /blog/post -> blog/post.gohtml
+				relPath := strings.TrimPrefix(route, "/")
+				if relPath == "" {
+					relPath = "index"
+				}
+				pageFile = filepath.Join(config.PagesDir, relPath+".gohtml")
+			} else {
+				// If provided, it's relative to PagesDir
+				pageFile = filepath.Join(config.PagesDir, pageFile)
 			}
-			pageFile = filepath.Join(config.PagesDir, relPath+".gohtml")
-		} else {
-			// If provided, it's relative to PagesDir
-			pageFile = filepath.Join(config.PagesDir, pageFile)
-		}
 
-		tmpl, err := buildTemplateForWithConfig(pageFile, config)
-		if err != nil {
-			return nil, fmt.Errorf("building template for router route %s (file: %s): %w", route, pageFile, err)
+			var err error
+			tmpl, err = buildTemplateForWithConfig(pageFile, config)
+			if err != nil {
+				return nil, fmt.Errorf("building template for router route %s (file: %s): %w", route, pageFile, err)
+			}
 		}
 
 		pages[route] = &Page{
@@ -646,6 +676,9 @@ func loadPagesWithConfig(config *Config, routerRoutes map[string]PageHook) (map[
 			if hook.Data != nil {
 				p.Data = hook.Data
 			}
+			if hook.NoTemplate {
+				p.Template = nil
+			}
 			if hook.Post != nil {
 				if p.Post == nil {
 					p.Post = map[string]func(w http.ResponseWriter, r *http.Request) (any, error){}
@@ -655,23 +688,27 @@ func loadPagesWithConfig(config *Config, routerRoutes map[string]PageHook) (map[
 				}
 			}
 		} else {
-			// If it doesn't exist, we need to load the template
-			pageFile := hook.Template
-			if pageFile == "" {
-				relPath := strings.TrimPrefix(route, "/")
-				if relPath == "" {
-					relPath = "index"
+			var tmpl *template.Template
+			if !hook.NoTemplate {
+				// If it doesn't exist, we need to load the template
+				pageFile := hook.Template
+				if pageFile == "" {
+					relPath := strings.TrimPrefix(route, "/")
+					if relPath == "" {
+						relPath = "index"
+					}
+					pageFile = filepath.Join(config.PagesDir, relPath+".gohtml")
+				} else {
+					pageFile = filepath.Join(config.PagesDir, pageFile)
 				}
-				pageFile = filepath.Join(config.PagesDir, relPath+".gohtml")
-			} else {
-				pageFile = filepath.Join(config.PagesDir, pageFile)
-			}
 
-			tmpl, err := buildTemplateForWithConfig(pageFile, config)
-			if err != nil {
-				// We log instead of returning error for legacy compatibility if template is missing
-				log.Printf("warning: legacy RegisterPage route %s failed to load template %s: %v", route, pageFile, err)
-				continue
+				var err error
+				tmpl, err = buildTemplateForWithConfig(pageFile, config)
+				if err != nil {
+					// We log instead of returning error for legacy compatibility if template is missing
+					log.Printf("warning: legacy RegisterPage route %s failed to load template %s: %v", route, pageFile, err)
+					continue
+				}
 			}
 
 			pages[route] = &Page{

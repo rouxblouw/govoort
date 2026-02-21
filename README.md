@@ -174,6 +174,22 @@ r.RegisterPage("/contact", govoort.PageHook{
 
 If `Template` is omitted, Govoort infers the template path from the route (e.g., `/contact` -> `web/pages/contact.gohtml`).
 
+### Registering API Routes (No Template)
+
+If you want to handle the response manually (e.g., for JSON APIs) without a template, use `RegisterRoute`.
+
+```go
+r.RegisterRoute("/api/hello", govoort.PageHook{
+    Data: func(w http.ResponseWriter, r *http.Request) (any, error) {
+        w.Header().Set("Content-Type", "application/json")
+        fmt.Fprintf(w, `{"message": "hello world"}`)
+        return nil, nil
+    },
+})
+```
+
+When using `RegisterRoute`, Govoort skips template lookup and execution. If your `Data` or `Post` handler writes to the `ResponseWriter`, Govoort stops processing and doesn't attempt to render anything.
+
 ### Nested Routers
 
 Routers can be mounted under a prefix:

@@ -1,6 +1,7 @@
 package tests_test
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -182,5 +183,47 @@ func TestAutoRegisterPagesSetting(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected 200 for index with auto-registration on, got %d", resp.StatusCode)
+	}
+}
+
+func TestRegisterRoute(t *testing.T) {
+	tmpDir := setupTestPages(t)
+	defer os.RemoveAll(tmpDir)
+
+	config := govoort.DefaultConfig()
+	config.PagesDir = filepath.Join(tmpDir, "web/pages")
+
+	r := govoort.NewRouter()
+	r.RegisterRoute("/api/hello", govoort.PageHook{
+		Data: func(w http.ResponseWriter, r *http.Request) (any, error) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"message": "hello world"}`))
+			return nil, nil
+		},
+	})
+
+	config.Router = r
+
+	server, err := govoort.New(config)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != `{"message": "hello world"}` {
+		t.Errorf("unexpected body: %s", string(body))
 	}
 }

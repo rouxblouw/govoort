@@ -13,6 +13,7 @@ func main() {
 	// api := ui.NewRouter()
 
 	app := ui.NewRouter()
+	app.Use(ui.RequestLogging)
 	app.Use(ui.Recover)
 	app.Use(ui.ErrorMiddleware)
 	app.Get("/", home.Route)

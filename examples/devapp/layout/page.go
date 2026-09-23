@@ -37,10 +37,27 @@ func (c *Component) Render() (template.HTML, error) {
 	if err != nil {
 		return "", err
 	}
+
+	var refs []ui.AssetRef
+	refs = append(refs, ui.CollectAssets(c.Props.Header)...)
+	refs = append(refs, ui.CollectAssets(c.Props.Content)...)
+	refs = append(refs, ui.CollectAssets(c.Props.Footer)...)
+	refs = ui.DedupeAssets(refs)
+
+	var assetsBuf bytes.Buffer
+	for _, ref := range refs {
+		url := ui.AssetURL(ref.Name, ref.Kind)
+		if ref.Kind == ui.AssetCSS {
+			assetsBuf.WriteString(`<link rel="stylesheet" href="` + url + `">`)
+		} else {
+			assetsBuf.WriteString(`<script src="` + url + `" defer></script>`)
+		}
+	}
+
 	var buf bytes.Buffer
 	err = tmpl.Execute(&buf, struct {
-		Title                   string
-		Header, Content, Footer template.HTML
-	}{c.Props.Title, header, content, footer})
+		Title                           string
+		Header, Content, Footer, Assets template.HTML
+	}{c.Props.Title, header, content, footer, template.HTML(assetsBuf.String())})
 	return template.HTML(buf.String()), err
 }

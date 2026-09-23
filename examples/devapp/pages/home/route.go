@@ -11,6 +11,7 @@ import (
 var siteNav = nav.New(nav.Props{
 	Links: []nav.Link{
 		{Label: "Home", Href: "/"},
+		{Label: "Like Demo", Href: "/demo"},
 		{Label: "About", Href: "/about"},
 	},
 })

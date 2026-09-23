@@ -2,6 +2,7 @@ package main
 
 import (
 	"devapp/pages/about"
+	"devapp/pages/demo"
 	"devapp/pages/home"
 	"log"
 	"net/http"
@@ -16,8 +17,10 @@ func main() {
 	app.Use(ui.RequestLogging)
 	app.Use(ui.Recover)
 	app.Use(ui.ErrorMiddleware)
+	app.RawGet("/assets/{file...}", ui.AssetsHandler)
 	app.Get("/", home.Route)
 	app.Get("/about", about.Route)
+	app.Get("/demo", demo.Route)
 
 	// app.Mount("/api", api)
 

@@ -1,0 +1,7 @@
+/* The preferred approach to scope this css only to a specific class, 
+ideally matching a parent html node of your component. */
+@scope (.c-card) {
+  h3 { margin: 0; }
+  .card-body { color: #555; }
+}
+.c-card--popular { border-color: gold; }

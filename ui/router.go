@@ -24,9 +24,7 @@ type Context struct {
 // HandlerFunc is our equivalent of an Express route handler.
 type HandlerFunc func(ctx *Context) error
 
-// Middleware wraps a HandlerFunc to produce a new HandlerFunc — same shape
-// as Express's (req,res,next) middleware, just curried instead of using a
-// next() callback.
+// Middleware wraps a HandlerFunc to produce a new HandlerFunc
 type Middleware func(next HandlerFunc) HandlerFunc
 
 // The Router
@@ -49,8 +47,7 @@ func (rt *Router) Get(pattern string, h HandlerFunc)  { rt.handle("GET", pattern
 func (rt *Router) Post(pattern string, h HandlerFunc) { rt.handle("POST", pattern, h) }
 
 func (rt *Router) handle(method, pattern string, h HandlerFunc) {
-	// wrap innermost-out: middleware registered first ends up outermost,
-	// same order Express applies a chain of .use() calls
+	// wrap innermost-out: middleware registered first ends up outermost
 	for i := len(rt.middleware) - 1; i >= 0; i-- {
 		h = rt.middleware[i](h)
 	}
@@ -62,9 +59,15 @@ func (rt *Router) handle(method, pattern string, h HandlerFunc) {
 	})
 }
 
+// Raw registers a plain http.HandlerFunc, bypassing Page/Json and all
+// framework middleware (Recover, ErrorMiddleware, Logging, etc). Intended
+// for static assets and similar low-risk, framework-agnostic routes.
+func (rt *Router) RawGet(pattern string, h http.HandlerFunc) {
+	rt.mux.HandleFunc("GET "+pattern, h)
+}
+
 // ServeHTTP makes Router itself an http.Handler — this is what lets a
-// Router be mounted inside another one (step 5c) or passed straight to
-// http.ListenAndServe.
+// Router be mounted inside another one
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rt.mux.ServeHTTP(w, r)
 }
